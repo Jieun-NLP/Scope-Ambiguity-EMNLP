@@ -102,7 +102,7 @@ def main() -> None:
             spacy_model=args.spacy_model,
         )
         print(f"Token-level results: {token_results['raw_jsonl']}")
-        print(f"Case pairs processed: {token_results['pairs_processed']}")
+        
 
     sentence_results = compute_record_surprisals(
         model,

@@ -1,25 +1,54 @@
 #!/usr/bin/env python3
-"""Experiment 2B: target-sentence residual-stream activation patching.
-
-The same protocol is used for LLaMA, Mistral, and Qwen. Model-specific
-architectural handling is confined to ``src.activation_patching``.
-
-For each aligned condition pair, this script patches the post-MLP residual
-states of the complete target-sentence span in both directions and measures the
-change in target-sentence surprisal. It also runs the span-mean replacement
-baseline reported in the paper.
 """
-from __future__ import annotations
-import sys
-from pathlib import Path
+Experiment 2B: activation patching with precomputed, token-aligned sentence spans.
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
+This implementation is designed for the final SCOPEX analysis.
+
+Methodological choices
+----------------------
+1. The script DOES NOT re-tokenize ``full_text`` and DOES NOT repair sentence
+   spans at run time. It uses the token IDs and end-exclusive sentence spans
+   created during preprocessing:
+       full_text_ids
+       sentence_token_start
+       sentence_token_end
+
+2. Before patching, the two contextual conditions are aligned by item ID and
+   their stored target-sentence token ID sequences are compared EXACTLY.
+   Position-wise activation patching is performed only when the token sequences
+   are identical. This is essential because the intervention assumes that token
+   position j in the source corresponds to token position j in the target.
+
+3. Mismatched pairs are skipped by default and written to
+   ``excluded_alignment_mismatches.json``. Use ``--mismatch-policy error`` to
+   fail instead.
+
+4. Sentence spans use Python's standard end-exclusive convention [start, end).
+
+5. The intervention is applied at the output of each decoder block (the
+   post-MLP residual-stream state for LLaMA/Mistral/Qwen-style decoder blocks).
+
+6. Patching is bidirectional:
+       case 0 -> case 1
+       case 1 -> case 0
+   By default these correspond to:
+       (S | C_spec) -> (S | C_non)
+       (S | C_non)  -> (S | C_spec)
+
+7. The causal effect is:
+       delta_mean = patched mean sentence surprisal - clean mean sentence surprisal
+
+8. The span-mean replacement baseline is retained.
+
+This script intentionally avoids the offset-based re-tokenization/alignment
+repair that can introduce new boundary-token mismatches across contexts.
+"""
+
+from __future__ import annotations
 
 import argparse
 import json
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -42,11 +71,17 @@ from src.activation_patching import (  # noqa: E402
 )
 
 
+CASE_NAMES = {
+    "0": "S|C_spec",
+    "1": "S|C_non",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Experiment 2B: run bidirectional target-sentence residual-stream "
-            "activation patching and a span-mean replacement baseline."
+            "Experiment 2B: bidirectional residual-stream activation patching "
+            "using precomputed, exactly aligned target-sentence token spans."
         )
     )
     parser.add_argument("--model", required=True, help="Hugging Face model ID.")
@@ -54,74 +89,48 @@ def parse_args() -> argparse.Namespace:
         "--input-data",
         type=Path,
         required=True,
-        help="Processed JSON or JSONL dataset.",
+        help="Processed JSON/JSONL containing stored token IDs and sentence spans.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         required=True,
-        help="Directory for CSV files, repaired data, and figures.",
+        help="Directory for patching results, statistics, diagnostics, and figure.",
     )
-    parser.add_argument(
-        "--source-case",
-        default="0",
-        help="First condition label. Default: 0.",
-    )
-    parser.add_argument(
-        "--target-case",
-        default="1",
-        help="Second condition label. Default: 1.",
-    )
+    parser.add_argument("--source-case", default="0")
+    parser.add_argument("--target-case", default="1")
     parser.add_argument(
         "--layers",
         type=int,
         nargs="+",
         default=None,
-        help="Decoder layers to test. Omit to use every decoder layer.",
+        help="Decoder layers to test. Omit to use all layers.",
     )
     parser.add_argument(
         "--n-samples",
         type=int,
         default=None,
-        help="Optional number of aligned item pairs for a test run.",
+        help="Optional number of VALID aligned pairs for a test run.",
     )
     parser.add_argument(
-        "--device",
-        default=None,
-        help="Torch device such as cuda, cuda:0, or cpu.",
+        "--mismatch-policy",
+        choices=("skip", "error"),
+        default="skip",
+        help=(
+            "What to do if stored target token IDs differ across conditions. "
+            "Default: skip and report the pair."
+        ),
     )
+    parser.add_argument("--device", default=None)
     parser.add_argument(
         "--torch-dtype",
         choices=("float32", "float16", "bfloat16"),
         default=None,
-        help="Optional model-loading dtype.",
     )
-    parser.add_argument(
-        "--cache-dir",
-        type=Path,
-        default=None,
-        help="Optional Hugging Face cache directory.",
-    )
-    parser.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        help="Allow custom Hugging Face model code when required.",
-    )
-    parser.add_argument(
-        "--skip-span-repair",
-        action="store_true",
-        help="Use stored token IDs and sentence spans without retokenizing.",
-    )
-    parser.add_argument(
-        "--skip-span-mean-baseline",
-        action="store_true",
-        help="Skip the span-mean replacement baseline.",
-    )
-    parser.add_argument(
-        "--skip-plot",
-        action="store_true",
-        help="Save numeric results without generating a figure.",
-    )
+    parser.add_argument("--cache-dir", type=Path, default=None)
+    parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--skip-span-mean-baseline", action="store_true")
+    parser.add_argument("--skip-plot", action="store_true")
     return parser.parse_args()
 
 
@@ -129,15 +138,16 @@ def load_records(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise FileNotFoundError(f"Input data file not found: {path}")
 
-    with path.open("r", encoding="utf-8-sig") as input_file:
-        if path.suffix.lower() == ".jsonl":
-            return [json.loads(line) for line in input_file if line.strip()]
-        if path.suffix.lower() == ".json":
-            records = json.load(input_file)
-            if not isinstance(records, list):
+    with path.open("r", encoding="utf-8-sig") as f:
+        suffix = path.suffix.lower()
+        if suffix == ".jsonl":
+            return [json.loads(line) for line in f if line.strip()]
+        if suffix == ".json":
+            data = json.load(f)
+            if not isinstance(data, list):
                 raise ValueError("A JSON dataset must contain a top-level list.")
-            return records
-    raise ValueError("Input data must use the .json or .jsonl extension.")
+            return data
+    raise ValueError("Input data must use .json or .jsonl.")
 
 
 def normalize_case_label(value: Any) -> str:
@@ -157,122 +167,48 @@ def item_identifier(record: dict[str, Any]) -> str:
     return str(identifier)
 
 
-def normalize_text_for_alignment(text: str) -> str:
-    """Normalize harmless whitespace and quotation-mark variation."""
-    normalized = text.strip()
-    normalized = normalized.replace("“", '"').replace("”", '"')
-    normalized = normalized.replace("‘", "'").replace("’", "'")
-    normalized = re.sub(r"\s+", " ", normalized)
-    return normalized
-
-
-def find_sentence_character_span(full_text: str, sentence: str) -> tuple[int, int]:
-    """Find the sentence in the full sequence using conservative fallbacks."""
-    start = full_text.find(sentence)
-    if start >= 0:
-        return start, start + len(sentence)
-
-    stripped_sentence = sentence.strip()
-    start = full_text.find(stripped_sentence)
-    if start >= 0:
-        return start, start + len(stripped_sentence)
-
-    raise ValueError("The target sentence was not found in full_text.")
-
-
-def repair_sentence_span_with_offsets(
-    record: dict[str, Any],
-    tokenizer,
-) -> None:
-    """Retokenize a record and derive an end-exclusive target-sentence span."""
-    full_text = record.get("full_text")
-    sentence = record.get("sentence")
-    if not isinstance(full_text, str) or not isinstance(sentence, str):
-        raise KeyError("Span repair requires string 'full_text' and 'sentence' fields.")
-
-    character_start, character_end = find_sentence_character_span(full_text, sentence)
-    encoding = tokenizer(
-        full_text,
-        add_special_tokens=True,
-        return_offsets_mapping=True,
-        return_attention_mask=False,
-    )
-    offsets = encoding.pop("offset_mapping")
-    token_ids = encoding["input_ids"]
-
-    overlapping_indices = [
-        index
-        for index, (token_start, token_end) in enumerate(offsets)
-        if token_end > token_start
-        and token_end > character_start
-        and token_start < character_end
-    ]
-    if not overlapping_indices:
-        raise ValueError("No tokenizer offsets overlap the target sentence.")
-
-    sentence_start = min(overlapping_indices)
-    sentence_end = max(overlapping_indices) + 1
-    if sentence_start >= sentence_end:
-        raise ValueError("The repaired sentence span is empty.")
-
-    record["full_text_ids"] = [int(token_id) for token_id in token_ids]
-    record["sentence_token_start"] = int(sentence_start)
-    record["sentence_token_end"] = int(sentence_end)
-
-
-def validate_stored_span(record: dict[str, Any]) -> None:
+def validate_stored_record(record: dict[str, Any]) -> None:
     required = ("full_text_ids", "sentence_token_start", "sentence_token_end")
     missing = [key for key in required if key not in record]
     if missing:
         raise KeyError(f"Missing required processed fields: {missing}")
+
     token_ids = record["full_text_ids"]
+    if not isinstance(token_ids, list) or not token_ids:
+        raise ValueError("'full_text_ids' must be a non-empty list.")
+
     start = int(record["sentence_token_start"])
     end = int(record["sentence_token_end"])
+
+    # Stored SCOPEX spans are end-exclusive: [start, end).
     if not 0 <= start < end <= len(token_ids):
         raise ValueError(
-            f"Invalid stored sentence span [{start}, {end}) for "
-            f"sequence length {len(token_ids)}."
+            f"Invalid end-exclusive sentence span [{start}, {end}) "
+            f"for sequence length {len(token_ids)}."
         )
 
 
-def prepare_records(
-    records: list[dict[str, Any]],
-    tokenizer,
-    *,
-    repair_spans: bool,
-) -> list[dict[str, Any]]:
-    failures: list[dict[str, Any]] = []
-    for record in records:
-        try:
-            if repair_spans:
-                repair_sentence_span_with_offsets(record, tokenizer)
-            else:
-                validate_stored_span(record)
-        except Exception as error:
-            failures.append(
-                {
-                    "id": record.get("id", record.get("idx")),
-                    "case": record.get("case"),
-                    "error": str(error),
-                }
-            )
-
-    if failures:
-        preview = json.dumps(failures[:10], ensure_ascii=False, indent=2)
-        raise ValueError(
-            f"Could not prepare {len(failures)} records. Examples:\n{preview}"
-        )
-    return records
+def stored_sentence_ids(record: dict[str, Any]) -> list[int]:
+    start = int(record["sentence_token_start"])
+    end = int(record["sentence_token_end"])
+    return [int(x) for x in record["full_text_ids"][start:end]]
 
 
-def build_aligned_pairs(
+def build_exactly_aligned_pairs(
     records: Iterable[dict[str, Any]],
     tokenizer,
     first_case: str,
     second_case: str,
+    mismatch_policy: str,
     n_samples: int | None,
-) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """Pair conditions by item ID and verify target-sentence alignment."""
+) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], list[dict[str, Any]]]:
+    """
+    Align condition pairs by item ID and require exact stored target-token IDs.
+
+    Exact equality is deliberately stronger than decoded-text equality because
+    residual-stream patching is position-wise. Equal strings with different
+    tokenizations are not considered safe for direct token-position patching.
+    """
     by_case: dict[str, dict[str, dict[str, Any]]] = {
         first_case: {},
         second_case: {},
@@ -282,6 +218,7 @@ def build_aligned_pairs(
         case = normalize_case_label(record.get("case"))
         if case not in by_case:
             continue
+        validate_stored_record(record)
         identifier = item_identifier(record)
         if identifier in by_case[case]:
             raise ValueError(f"Duplicate item ID {identifier!r} in case {case!r}.")
@@ -290,54 +227,63 @@ def build_aligned_pairs(
     first_ids = set(by_case[first_case])
     second_ids = set(by_case[second_case])
     if first_ids != second_ids:
-        only_first = sorted(first_ids - second_ids)[:10]
-        only_second = sorted(second_ids - first_ids)[:10]
         raise ValueError(
             "Condition item IDs do not match. "
-            f"Only in {first_case}: {only_first}; only in {second_case}: {only_second}."
+            f"Only in {first_case}: {sorted(first_ids-second_ids)[:10]}; "
+            f"only in {second_case}: {sorted(second_ids-first_ids)[:10]}."
         )
 
-    item_ids = sorted(first_ids)
-    if n_samples is not None:
-        if n_samples < 1:
-            raise ValueError("n_samples must be positive.")
-        item_ids = item_ids[:n_samples]
+    valid_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    mismatches: list[dict[str, Any]] = []
 
-    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    text_failures: list[dict[str, Any]] = []
-    for identifier in item_ids:
+    # Numeric sort when possible, otherwise lexical.
+    def sort_key(x: str):
+        return (0, int(x)) if x.isdigit() else (1, x)
+
+    for identifier in sorted(first_ids, key=sort_key):
         first = by_case[first_case][identifier]
         second = by_case[second_case][identifier]
 
-        first_span = first["full_text_ids"][
-            int(first["sentence_token_start"]) : int(first["sentence_token_end"])
-        ]
-        second_span = second["full_text_ids"][
-            int(second["sentence_token_start"]) : int(second["sentence_token_end"])
-        ]
-        first_text = tokenizer.decode(first_span, skip_special_tokens=True).strip()
-        second_text = tokenizer.decode(second_span, skip_special_tokens=True).strip()
+        ids_first = stored_sentence_ids(first)
+        ids_second = stored_sentence_ids(second)
 
-        if normalize_text_for_alignment(first_text) != normalize_text_for_alignment(
-            second_text
-        ):
-            text_failures.append(
+        if ids_first != ids_second:
+            mismatches.append(
                 {
                     "id": identifier,
-                    "first_decoded": first_text,
-                    "second_decoded": second_text,
+                    "first_case": first_case,
+                    "second_case": second_case,
+                    "first_span_length": len(ids_first),
+                    "second_span_length": len(ids_second),
+                    "first_token_ids": ids_first,
+                    "second_token_ids": ids_second,
+                    "first_decoded": tokenizer.decode(
+                        ids_first, skip_special_tokens=True
+                    ),
+                    "second_decoded": tokenizer.decode(
+                        ids_second, skip_special_tokens=True
+                    ),
+                    "first_sentence": first.get("sentence"),
+                    "second_sentence": second.get("sentence"),
                 }
             )
-        pairs.append((first, second))
+            continue
 
-    if text_failures:
-        preview = json.dumps(text_failures[:10], ensure_ascii=False, indent=2)
+        valid_pairs.append((first, second))
+
+    if mismatches and mismatch_policy == "error":
+        preview = json.dumps(mismatches[:10], ensure_ascii=False, indent=2)
         raise ValueError(
-            f"{len(text_failures)} condition pairs have different target "
-            f"sentences after tokenization. Examples:\n{preview}"
+            f"{len(mismatches)} pair(s) have non-identical stored target-token "
+            f"sequences and cannot be position-wise patched safely.\n{preview}"
         )
 
-    return pairs
+    if n_samples is not None:
+        if n_samples < 1:
+            raise ValueError("--n-samples must be positive.")
+        valid_pairs = valid_pairs[:n_samples]
+
+    return valid_pairs, mismatches
 
 
 def convert_torch_dtype(dtype_name: str | None):
@@ -355,25 +301,25 @@ def load_model_and_tokenizer(args: argparse.Namespace):
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
     token = os.getenv("HF_TOKEN")
-    common_kwargs = {
+    kwargs = {
         "token": token,
         "trust_remote_code": args.trust_remote_code,
     }
     if args.cache_dir is not None:
-        common_kwargs["cache_dir"] = str(args.cache_dir)
+        kwargs["cache_dir"] = str(args.cache_dir)
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,
         use_fast=True,
-        **common_kwargs,
+        **kwargs,
     )
-    if not tokenizer.is_fast and not args.skip_span_repair:
-        raise ValueError("Offset-based sentence-span repair requires a fast tokenizer.")
 
+    # Keep compatibility with current Transformers while avoiding dependence on
+    # the deprecated torch_dtype keyword when possible.
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=convert_torch_dtype(args.torch_dtype),
-        **common_kwargs,
+        dtype=convert_torch_dtype(args.torch_dtype),
+        **kwargs,
     )
     model.to(device)
     model.eval()
@@ -381,23 +327,17 @@ def load_model_and_tokenizer(args: argparse.Namespace):
 
 
 def select_layers(model, requested_layers: list[int] | None) -> list[int]:
-    number_of_layers = len(get_transformer_layers(model))
+    n_layers = len(get_transformer_layers(model))
     if requested_layers is None:
-        return list(range(number_of_layers))
+        return list(range(n_layers))
 
     selected = sorted(set(requested_layers))
-    invalid = [layer for layer in selected if layer < 0 or layer >= number_of_layers]
+    invalid = [x for x in selected if x < 0 or x >= n_layers]
     if invalid:
         raise ValueError(
-            f"Invalid decoder layers {invalid}; valid indices are "
-            f"0 through {number_of_layers - 1}."
+            f"Invalid decoder layers {invalid}; valid range is 0..{n_layers-1}."
         )
     return selected
-
-
-def save_repaired_records(records: list[dict[str, Any]], output_path: Path) -> None:
-    with output_path.open("w", encoding="utf-8") as output_file:
-        json.dump(records, output_file, ensure_ascii=False, indent=2)
 
 
 def run_patching(
@@ -416,11 +356,19 @@ def run_patching(
             for layer in layers:
                 forward = run_single_patch(model, tokenizer, first, second, layer)
                 forward["direction"] = f"case{first_case}_to_case{second_case}"
+                forward["direction_label"] = (
+                    f"{CASE_NAMES.get(first_case, 'case'+first_case)} -> "
+                    f"{CASE_NAMES.get(second_case, 'case'+second_case)}"
+                )
                 results.append(forward)
                 progress.update(1)
 
                 reverse = run_single_patch(model, tokenizer, second, first, layer)
                 reverse["direction"] = f"case{second_case}_to_case{first_case}"
+                reverse["direction_label"] = (
+                    f"{CASE_NAMES.get(second_case, 'case'+second_case)} -> "
+                    f"{CASE_NAMES.get(first_case, 'case'+first_case)}"
+                )
                 results.append(reverse)
                 progress.update(1)
 
@@ -442,20 +390,14 @@ def run_span_mean_baseline(
         for first, second in pairs:
             for layer in layers:
                 first_result = run_single_span_mean_replacement(
-                    model,
-                    tokenizer,
-                    first,
-                    layer,
+                    model, tokenizer, first, layer
                 )
                 first_result["direction"] = f"span_mean_case{first_case}"
                 results.append(first_result)
                 progress.update(1)
 
                 second_result = run_single_span_mean_replacement(
-                    model,
-                    tokenizer,
-                    second,
-                    layer,
+                    model, tokenizer, second, layer
                 )
                 second_result["direction"] = f"span_mean_case{second_case}"
                 results.append(second_result)
@@ -465,13 +407,13 @@ def run_span_mean_baseline(
 
 
 def save_layer_statistics(results: pd.DataFrame, output_path: Path) -> pd.DataFrame:
-    statistics = (
-        results.groupby(["layer_idx", "direction"])["delta_mean"]
+    stats_df = (
+        results.groupby(["layer_idx", "direction", "direction_label"])["delta_mean"]
         .agg(["mean", "std", "count"])
         .reset_index()
     )
-    statistics.to_csv(output_path, index=False)
-    return statistics
+    stats_df.to_csv(output_path, index=False)
+    return stats_df
 
 
 def plot_results(
@@ -480,50 +422,59 @@ def plot_results(
     output_path: Path,
 ) -> None:
     patch_curves = (
-        patching_results.groupby(["layer_idx", "direction"])["delta_mean"]
+        patching_results.groupby(["layer_idx", "direction_label"])["delta_mean"]
         .mean()
         .unstack()
         .sort_index()
     )
 
     if span_mean_results is None or span_mean_results.empty:
-        figure, axis = plt.subplots(figsize=(12, 5))
-        for direction in patch_curves.columns:
-            axis.plot(
-                patch_curves.index,
-                patch_curves[direction],
-                marker="o",
-                label=direction,
-            )
-        axis.axhline(0, linestyle="--", linewidth=1, alpha=0.6)
-        axis.set_xlabel("Layer")
-        axis.set_ylabel("Change in mean surprisal (bits)")
-        axis.legend()
-        axis.grid(alpha=0.3)
-        figure.tight_layout()
-        figure.savefig(output_path, dpi=300, bbox_inches="tight")
-        plt.close(figure)
+        fig, ax = plt.subplots(figsize=(11, 5))
+        for label in patch_curves.columns:
+            ax.plot(patch_curves.index, patch_curves[label], marker="o", label=label)
+        ax.axhline(0, linestyle="--", linewidth=1, alpha=0.6)
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("Change in mean sentence surprisal (bits)")
+        ax.legend()
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
         return
 
     span_curve = (
         span_mean_results.groupby("layer_idx")["delta_mean"].mean().sort_index()
     )
-    figure, (top_axis, bottom_axis) = plt.subplots(
+
+    fig, (top_ax, bottom_ax) = plt.subplots(
         2,
         1,
         sharex=True,
-        figsize=(12, 7),
+        figsize=(11, 7),
         gridspec_kw={"height_ratios": [1, 2.4], "hspace": 0.06},
     )
+    plot_order = [
+    "S|C_spec -> S|C_non",
+    "S|C_non -> S|C_spec",
+    ]
+    
+    STYLE_MAP = {"S|C_spec -> S|C_non": {"marker": "o"   # blue + circle
+                                         },
+        "S|C_non -> S|C_spec": {
+        "marker": "^"   # orange + triangle
+        },}
 
-    for direction in patch_curves.columns:
-        bottom_axis.plot(
-            patch_curves.index,
-            patch_curves[direction],
-            marker="o",
-            label=direction,
+    for label in plot_order:
+        if label not in patch_curves.columns:
+            continue
+        
+        bottom_ax.plot(patch_curves.index, 
+                       patch_curves[label], 
+                       marker=STYLE_MAP[label]["marker"], 
+                       label=label
         )
-    top_axis.plot(
+
+    top_ax.plot(
         span_curve.index,
         span_curve.values,
         marker="x",
@@ -531,32 +482,22 @@ def plot_results(
         label="Span-mean replacement baseline",
     )
 
-    bottom_axis.axhline(0, linestyle="--", linewidth=1, alpha=0.6)
-    bottom_axis.set_xlabel("Layer")
-    bottom_axis.set_ylabel("Patching effect (bits)")
-    top_axis.set_ylabel("Baseline effect (bits)")
-    bottom_axis.grid(alpha=0.3)
-    top_axis.grid(alpha=0.3)
-    bottom_axis.legend()
-    top_axis.legend()
+    bottom_ax.axhline(0, linestyle="--", linewidth=1, alpha=0.6)
+    bottom_ax.set_xlabel("Layer")
+    bottom_ax.set_ylabel("Patching effect (bits)")
+    top_ax.set_ylabel("Baseline effect (bits)")
+    bottom_ax.grid(alpha=0.3)
+    top_ax.grid(alpha=0.3)
+    bottom_ax.legend()
+    top_ax.legend()
 
-    top_axis.spines["bottom"].set_visible(False)
-    bottom_axis.spines["top"].set_visible(False)
-    top_axis.tick_params(labeltop=False)
-    bottom_axis.xaxis.tick_bottom()
+    top_ax.spines["bottom"].set_visible(False)
+    bottom_ax.spines["top"].set_visible(False)
 
-    diagonal_size = 0.012
-    top_kwargs = dict(transform=top_axis.transAxes, color="k", clip_on=False)
-    top_axis.plot((-diagonal_size, +diagonal_size), (-diagonal_size, +diagonal_size), **top_kwargs)
-    top_axis.plot((1 - diagonal_size, 1 + diagonal_size), (-diagonal_size, +diagonal_size), **top_kwargs)
-    bottom_kwargs = dict(transform=bottom_axis.transAxes, color="k", clip_on=False)
-    bottom_axis.plot((-diagonal_size, +diagonal_size), (1 - diagonal_size, 1 + diagonal_size), **bottom_kwargs)
-    bottom_axis.plot((1 - diagonal_size, 1 + diagonal_size), (1 - diagonal_size, 1 + diagonal_size), **bottom_kwargs)
-
-    figure.suptitle("Experiment 2B: Residual-Stream Activation Patching")
-    figure.tight_layout()
-    figure.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(figure)
+    fig.suptitle("Experiment 2B: Residual-Stream Activation Patching")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
 
 def main() -> None:
@@ -566,57 +507,51 @@ def main() -> None:
     model, tokenizer, device = load_model_and_tokenizer(args)
     layers = select_layers(model, args.layers)
     records = load_records(args.input_data)
-    records = prepare_records(
-        records,
-        tokenizer,
-        repair_spans=not args.skip_span_repair,
-    )
-
-    repaired_path = args.output_dir / "processed_data_repaired_spans.json"
-    save_repaired_records(records, repaired_path)
 
     first_case = normalize_case_label(args.source_case)
     second_case = normalize_case_label(args.target_case)
-    pairs = build_aligned_pairs(
+
+    pairs, mismatches = build_exactly_aligned_pairs(
         records,
         tokenizer,
         first_case,
         second_case,
+        args.mismatch_policy,
         args.n_samples,
     )
 
+    mismatch_path = args.output_dir / "excluded_alignment_mismatches.json"
+    with mismatch_path.open("w", encoding="utf-8") as f:
+        json.dump(mismatches, f, ensure_ascii=False, indent=2)
+
     print(f"Model: {args.model}")
     print(f"Device: {device}")
-    print(f"Aligned pairs: {len(pairs)}")
+    print(f"Candidate paired IDs: {len(pairs) + len(mismatches)}")
+    print(f"Exactly token-aligned pairs used: {len(pairs)}")
+    print(f"Excluded alignment mismatches: {len(mismatches)}")
+    if mismatches:
+        print("Excluded IDs:", ", ".join(str(x["id"]) for x in mismatches))
     print(f"Decoder layers: {layers}")
 
+    if not pairs:
+        raise ValueError("No exactly aligned condition pairs remain for patching.")
+
     patching_results = run_patching(
-        model,
-        tokenizer,
-        pairs,
-        layers,
-        first_case,
-        second_case,
+        model, tokenizer, pairs, layers, first_case, second_case
     )
     patching_path = args.output_dir / "patching_results.csv"
     patching_results.to_csv(patching_path, index=False)
 
-    statistics_path = args.output_dir / "layer_stats.csv"
-    save_layer_statistics(patching_results, statistics_path)
+    stats_path = args.output_dir / "layer_stats.csv"
+    save_layer_statistics(patching_results, stats_path)
 
-    span_mean_results: pd.DataFrame | None = None
+    span_mean_results = None
     if not args.skip_span_mean_baseline:
         span_mean_results = run_span_mean_baseline(
-            model,
-            tokenizer,
-            pairs,
-            layers,
-            first_case,
-            second_case,
+            model, tokenizer, pairs, layers, first_case, second_case
         )
         span_mean_results.to_csv(
-            args.output_dir / "span_mean_replacement_results.csv",
-            index=False,
+            args.output_dir / "span_mean_replacement_results.csv", index=False
         )
 
     if not args.skip_plot:
@@ -626,9 +561,9 @@ def main() -> None:
             args.output_dir / "activation_patching_results.png",
         )
 
-    print(f"Saved repaired data: {repaired_path}")
     print(f"Saved patching results: {patching_path}")
-    print(f"Saved layer statistics: {statistics_path}")
+    print(f"Saved layer statistics: {stats_path}")
+    print(f"Saved alignment diagnostics: {mismatch_path}")
     if span_mean_results is not None:
         print(
             "Saved span-mean baseline: "

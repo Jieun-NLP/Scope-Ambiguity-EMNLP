@@ -1,6 +1,30 @@
+# Environment
+
 .env
 .env.*
 .venv/
 venv/
+
+# Python
+
 __pycache__/
 *.py[cod]
+*.pyo
+
+# Jupyter
+
+.ipynb_checkpoints/
+
+# macOS
+
+.DS_Store
+
+# Generated experiment outputs
+
+results/
+outputs/
+
+# Temporary files
+
+*.log
+*.tmp
