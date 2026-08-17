@@ -68,29 +68,47 @@ Make sure that the token has permission to access the model being used.
 
 ## Repository Structure
 
-``` text
+```text
 Scope-Ambiguity-EMNLP/
 ├── data/
 │   ├── processed/
+│   │   ├── processed_data_6set_combined_with_span_Llama3.jsonl
+│   │   ├── processed_data_6set_combined_with_span_Mistral.jsonl
+│   │   ├── processed_data_6set_combined_with_span_Qwen2.5.jsonl
+│   │   ├── processed_data_Exp2C_Llama3.jsonl
+│   │   ├── processed_data_Exp2C_Mistral.jsonl
+│   │   ├── processed_data_Exp2C_Qwen2.5.jsonl
+│   │   └── extracted_qp2s_updated.json
+│   │
 │   └── specificity/
+│       └── synthetic_specificity_dataset.jsonl
+│
 ├── docs/
 │   └── RUN_EXAMPLES.md
+│
 ├── scripts/
 │   ├── Experiment1.py
+│   ├── analyze_experiment1.py
+│   │
 │   ├── extract_sentence_representation_for_Exp2A.py
 │   ├── Experiment2A.py
+│   │
 │   ├── Experiment2B.py
+│   │
 │   ├── prepare_target_np_spans_for_Exp2C.py
 │   ├── extract_specificity_representation_for_Exp2C.py
 │   ├── train_specificity_probe_for_Exp2C.py
 │   └── infer_specificity_probe_for_Exp2C.py
+│
 ├── src/
+│   ├── activation_patching.py
 │   ├── probing.py
 │   ├── target_span.py
 │   └── ...
+│
 ├── README.md
-└── requirements.txt
-```
+├── requirements.txt
+└── .gitignore
 
 Reusable functions shared across experiments are placed under `src/`,
 while executable experiment pipelines are under `scripts/`.
@@ -141,30 +159,38 @@ before being applied to SCOPEX.
 
 ## Experiment 1: Surprisal-Based Disambiguation
 
-Experiment 1 measures how preceding contexts affect sentence-level and
-token-level surprisal across the six SCOPEX conditions.
+Experiment 1 measures how preceding contexts affect sentence-level and token-level surprisal across the six SCOPEX conditions.
 
-Example:
+The experiment consists of two stages:
 
-``` bash
+1. Generate surprisal measurements.
+2. Analyze the generated outputs to reproduce the statistical tables reported in the paper.
+
+### Step 1. Run the surprisal analysis
+
+```bash
 python scripts/Experiment1.py \
     --input data/processed/processed_data_6set_combined_with_span_Llama3.jsonl \
     --output-root results/Llama3-8B \
     --model meta-llama/Meta-Llama-3-8B
-```
 
-Generated files include:
-
-``` text
+Generated files:
 results/Llama3-8B/surprisal/
 ├── token_deltas_insitu_spacy_all.jsonl
 ├── surprisal_records.jsonl
 └── case_aggregate.csv
-```
 
-The generated outputs can be used to reproduce the sentence-level
-statistics and scope-sensitivity analyses reported in the paper.
+### STep 2. Reproduce the paper tables
 
+```bash
+python scripts/analyze_experiment1.py \
+    --input-dir results/Llama3-8B/surprisal
+
+This analysis reproduces:
+
+Table 2: Mean surprisal
+Table 2: Pairwise statistical comparisons
+Table 3: Scope sensitivity
 ------------------------------------------------------------------------
 
 ## Experiment 2A: Layerwise Representation Similarity
